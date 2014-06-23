@@ -1,0 +1,23 @@
+<?php
+/**
+ * @file
+ * Contains Subgroup functionality for the Group module.
+ *
+ * Please note that this only adds a UI and access checks for creating
+ * subgroups. Nothing stops you from still programatically creating
+ * subgroups with Group::addSubgroup(). Using both at the same time is
+ * strongly discouraged unless you know what you are doing.
+ */
+
+/**
+ * Load our router functions without polluting the .module file.
+ */
+module_load_include('inc', 'ggroup', 'ggroup.router');
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function ggroup_entity_info_alter(&$entity_info) {
+  // Groups can only have one group parent.
+  $entity_info['group']['group entity'] = 'single';
+}

@@ -1,0 +1,13 @@
+name = Group invite
+description = Allows group members to invite people into their group
+core = 7.x
+package = Group
+
+dependencies[] = group
+
+; Information added by Drupal.org packaging script on 2014-04-01
+version = "7.x-1.x-dev"
+core = "7.x"
+project = "group"
+datestamp = "1396340652"
+

@@ -1,0 +1,587 @@
+<?php
+/**
+ * @file
+ * Contains Group's implementation of the Node module hooks and forms.
+ *
+ * Please note that this is an additional layer on top of the Entity
+ * implementation. For instance: we do not need hook_node_delete() because
+ * our implementation of hook_entity_delete() covers everything.
+ */
+
+/**
+ * Load our router functions without polluting the .module file.
+ */
+module_load_include('inc', 'gnode', 'gnode.router');
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function gnode_entity_info_alter(&$entity_info) {
+  // Nodes can only have one group parent.
+  $entity_info['node']['group entity'] = 'single';
+}
+
+/**
+ * Implements hook_group_permission().
+ *
+ * Polyfills permissions for the Node module and can therefore not reside
+ * inside the gnode.group.inc file.
+ */
+function node_group_permission() {
+  $permissions = array();
+
+  foreach (node_type_get_types() as $node_type) {
+    $replace = array('%node_type' => $node_type->name);
+
+    $permissions["view $node_type->type"] = array(
+      'title' => t('%node_type: View content', $replace),
+    );
+    $permissions["create $node_type->type"] = array(
+      'title' => t('%node_type: Create new content', $replace),
+    );
+    $permissions["update own $node_type->type"] = array(
+      'title' => t('%node_type: Edit own content', $replace),
+    );
+    $permissions["update any $node_type->type"] = array(
+      'title' => t('%node_type: Edit any content', $replace),
+    );
+    $permissions["delete own $node_type->type"] = array(
+      'title' => t('%node_type: Delete own content', $replace),
+    );
+    $permissions["delete any $node_type->type"] = array(
+      'title' => t('%node_type: Delete any content', $replace),
+    );
+  }
+
+  return $permissions;
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * Because the grant system for node access can quickly become very taxing on
+ * the site's performance, we chose to implement hook_node_access() instead.
+ *
+ * All list query related alterations that would otherwise be taken care of by
+ * the grant system still take place, albeit in Group Node's implementation of
+ * hook_query_TAG_alter() for 'node_access'.
+ *
+ * @see gnode_query_node_access_alter()
+ */
+function gnode_node_access($node, $op, $account) {
+  if (is_string($node)) {
+    if ($op == 'create') {
+      // If the user can bypass group access, he is allowed access.
+      if (user_access('bypass group access', $account)) {
+        return NODE_ACCESS_ALLOW;
+      }
+
+      // Check for all group types if an outsider can create nodes of the given
+      // node type in them.
+      foreach (group_types() as $type => $group_type) {
+        $has_access = in_array('administer group', $group_type->outsider_permissions);
+        $has_access = $has_access || in_array("create $node", $group_type->outsider_permissions);
+
+        // If the group type allows access to outsiders and the provided user
+        // has as at least one group of this type he is an outsider to, we
+        // allow access.
+        if ($has_access && group_outsider_gids($account->uid, $type)) {
+          return NODE_ACCESS_ALLOW;
+        }
+      }
+
+      // Check the user's groups for creation rights.
+      foreach (group_load_by_member($account->uid) as $group) {
+        $has_access = group_access('administer group', $group, $account);
+        $has_access = $has_access || group_access("create $node", $group, $account);
+
+        if ($has_access) {
+          return NODE_ACCESS_ALLOW;
+        }
+      }
+    }
+  }
+
+  // Make sure we are dealing with a group node.
+  elseif (!empty($node->group)) {
+    $group = group_load($node->group);
+
+    // If the user can bypass group access, he is allowed access.
+    if (user_access('bypass group access', $account)) {
+      return NODE_ACCESS_ALLOW;
+    }
+
+    $has_access = group_access('administer group', $group, $account);
+
+    switch ($op) {
+      case "view":
+        $has_access = $has_access || group_access("view $node->type", $group, $account);
+        break;
+      case "update":
+      case "delete":
+        $has_access = $has_access || group_access("$op any $node->type", $group, $account);
+
+        if ($account->uid == $node->uid) {
+          $has_access = $has_access || group_access("$op own $node->type", $group, $account);
+        }
+
+        break;
+    }
+
+    return $has_access ? NODE_ACCESS_ALLOW : NODE_ACCESS_DENY;
+  }
+
+  return NODE_ACCESS_IGNORE;
+}
+
+/**
+ * Adds group data to the node add form.
+ *
+ * @param Group $group
+ *   The group to create the node for.
+ * @param string $node_type
+ *   The type of node to create for the group.
+ *
+ * @return array
+ *   Returns the node editing form.
+ *
+ * @see node_add()
+ */
+function gnode_node_add($group, $node_type) {
+  global $user;
+
+  module_load_include('inc', 'node', 'node.pages');
+
+  $types = node_type_get_types();
+  $node = (object) array(
+    'uid' => $user->uid,
+    'name' => (isset($user->name) ? $user->name : ''),
+    'type' => $node_type,
+    'language' => LANGUAGE_NONE,
+    'group' => $group->gid,
+  );
+  drupal_set_title(t('Create @name', array('@name' => $types[$node_type]->name)), PASS_THROUGH);
+
+  // Build the arguments to pass to drupal_get_form().
+  $setup = array($node_type . '_node_form', $node);
+  $extra = array_slice(func_get_args(), 2);
+  $args = array_merge($setup, $extra);
+
+  // We call call_user_func_array() so we can add any extra argument
+  // that was provided through the URL. This will ensure paths like
+  // group/1/node/add/page/specialvar will function properly.
+  return call_user_func_array('drupal_get_form', $args);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Adds a Group vertical tab to the node form.
+ *
+ * You can only select those groups that you can create nodes of this type in.
+ * It would not make sense if someone could move nodes to a group where he does
+ * not have creation rights.
+ *
+ * @see gnode_node_validate()
+ * @see gnode_node_submit()
+ */
+function gnode_form_node_form_alter(&$form, $form_state) {
+  global $user;
+
+  $node = $form_state['node'];
+  $gid = !empty($node->group) ? $node->group : 0;
+
+  // Fix group for people that can't bypass access.
+  if (!user_access('bypass group access')) {
+    $form['gid'] = array(
+      '#type' => 'value',
+      '#value' => $gid,
+      '#parents' => array('group_settings', 'gid'),
+    );
+  }
+
+  // Fill in the selected group but allow changes.
+  else {
+    $group_name = '';
+
+    if ($gid) {
+      // Retrieve the default value for the autocomplete field.
+      $title = group_load($gid)->title;
+      $group_name = "$title (GID: $gid)";
+    }
+
+    // Add a vertical tab with an autocomplete field.
+    $form['group_settings'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Group settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+      '#group' => 'additional_settings',
+      '#attributes' => array(
+        'class' => array('node-form-group-information'),
+      ),
+      '#attached' => array(
+        'js' => array(drupal_get_path('module', 'gnode') . '/misc/gnode.js'),
+      ),
+      '#tree' => TRUE,
+      '#weight' => -50,
+    );
+
+    $form['group_settings']['group'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Parent group'),
+      '#autocomplete_path' => 'group/autocomplete',
+      '#default_value' => $group_name,
+      '#description' => t("Enter the name of the group to attach this node to. Leave blank for no group.<br /><strong>By selecting a group, the node will inherit the group's access control</strong>."),
+      // If the user can't create this node outside of a group, he is not allowed
+      // to move it to the sitewide scope either.
+      '#required' => !node_access('create', $node->type),
+    );
+  }
+}
+
+/**
+ * Implements hook_node_validate().
+ *
+ * Validates and processes the 'parent group' field.
+ *
+ * @see gnode_form_node_form_alter()
+ */
+function gnode_node_validate($node, $form, &$form_state) {
+  $values = $form_state['values']['group_settings'];
+
+  if (!empty($values['group'])) {
+    // Retrieve the group id from the name suffix.
+    if ($gid = group_autocomplete_result_gid($values['group'])) {
+      $form_state['values']['group_settings']['gid'] = $gid;
+    }
+    // Throw an error if the gid could not be retrieved.
+    else {
+      form_set_error('group_settings][group', t('Group name not found'));
+    }
+  }
+}
+
+/**
+ * Implements hook_node_submit().
+ *
+ * @see gnode_form_node_form_alter()
+ */
+function gnode_node_submit($node, $form, &$form_state) {
+  if (!empty($form_state['values']['group_settings']['gid'])) {
+    $node->group = $form_state['values']['group_settings']['gid'];
+  }
+  elseif (isset($node->group)) {
+    unset($node->group);
+  }
+}
+
+/**
+ * Helper function for gnode_query_node_access_alter().
+ *
+ * Provides access information to format query conditions with.
+ *
+ * @param object $account
+ *   The user account to retrieve access info for.
+ * @param string $op
+ *   The node operation to retrieve access info for.
+ *
+ * @return array
+ *   An associative array containing group ids the account has access to,
+ *   subdivided in three categories which  are keyed as follows:
+ *   - full access: For these group ids, the user has access to every node.
+ *   - type access: Keyed by node type. For these group ids, the user has
+ *     access to every node of the node type indicated by the array key.
+ *   - user access: Keyed by node type. For these group ids, the user has
+ *     access to every node of the node type indicated by the array key of
+ *     which he is also the author.
+ *
+ * @see gnode_query_node_access_alter().
+ */
+function _gnode_node_access_info($account, $op) {
+  // Initialize the array that will hold group ids.
+  $return = array();
+
+  // Gather the machine names of all node types.
+  $node_types = array_keys(node_type_get_types());
+
+  // Check access for groups the user is an outsider to.
+  foreach (group_types() as $type => $group_type) {
+    if ($outsider_gids = group_outsider_gids($account->uid, $type)) {
+      // If you can administer the group, you have full access to every node
+      // in that group. Add these group ids to 'full access'.
+      if (in_array('administer group', $group_type->outsider_permissions)) {
+        foreach ($outsider_gids as $gid) {
+          $return['full access'][$gid] = $gid;
+        }
+        continue;
+      }
+
+      foreach ($node_types as $node_type) {
+        // Use booleans for readability's sake.
+        $type_access = FALSE;
+        $user_access = FALSE;
+
+        // Shorten variable name for readability's sake.
+        $permissions = $group_type->outsider_permissions;
+
+        switch ($op) {
+          case 'view':
+            $type_access = in_array("view $node_type", $permissions);
+            break;
+          case 'update':
+          case 'delete':
+            $type_access = in_array("$op any $node_type", $permissions);
+            $user_access = in_array("$op own $node_type", $permissions);
+            break;
+        }
+
+        // If the user has access to this node type, we add all nodes of that
+        // node type (within the given group) to the list of accessible nodes.
+        if ($type_access) {
+          foreach ($outsider_gids as $gid) {
+            $return['type access'][$node_type][$gid] = $gid;
+          }
+        }
+
+        // Otherwise, if the user has author access to this node type, we add
+        // all nodes of that node type (within the given group) where the user
+        // is the author to the list of accessible nodes.
+        elseif ($user_access) {
+          foreach ($outsider_gids as $gid) {
+            $return['user access'][$node_type][$gid] = $gid;
+          }
+        }
+      }
+    }
+  }
+
+  // Check access for groups the user is a member of.
+  foreach (group_load_by_member($account->uid) as $group) {
+    // Store gid to keep code below concise.
+    $gid = $group->gid;
+
+    // If you can administer the group, you have full access to every node
+    // in that group. Add these group ids to 'full access'.
+    if (group_access('administer group', $group, $account)) {
+      $return['full access'][$gid] = $gid;
+      continue;
+    }
+
+    foreach ($node_types as $node_type) {
+      // Use booleans for readability's sake.
+      $type_access = FALSE;
+      $user_access = FALSE;
+
+      // Shorten variable name for readability's sake.
+      $permissions = $group_type->outsider_permissions;
+
+      switch ($op) {
+        case 'view':
+          $type_access = group_access("view $node_type", $group, $account);
+          break;
+        case 'update':
+        case 'delete':
+          $type_access = group_access("$op any $node_type", $group, $account);
+          $user_access = group_access("$op own $node_type", $group, $account);
+          break;
+      }
+
+      // If the user has access to this node type, we add all nodes of that
+      // node type (within the given group) to the list of accessible nodes.
+      if ($type_access) {
+        $return['type access'][$node_type][$gid] = $gid;
+      }
+
+      // If the user has author access to this node type, we add all nodes of
+      // that node type (within the given group) where the user is the author
+      // to the list of accessible nodes.
+      if ($user_access) {
+        $return['user access'][$node_type][$gid] = $gid;
+      }
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * @see _gnode_node_access_info().
+ */
+function gnode_query_node_access_alter(QueryAlterableInterface $query) {
+  global $user;
+
+  // Define the node table alias.
+  // @todo Monitor this. This could cause trouble if a query does not
+  // link to the node table but instead uses its own relation to nids.
+  // We default to 'n' to mitigate this potential hiccup.
+  $alias = 'n';
+  foreach ($query->getTables() as $info) {
+    if ($info['table'] == 'node') {
+      $alias = $info['alias'];
+      break;
+    }
+  }
+
+  // Read the account from the query, if provided.
+  if (!$account = $query->getMetaData('account')) {
+    $account = $user;
+  }
+
+  // Retrieve all node ids of group nodes along with their group id.
+  $group_nodes = db_select('group_entity', 'ge');
+  $group_nodes->addField('ge', 'gid');
+  $group_nodes->addField('ge', 'entity_id');
+  $group_nodes->condition('entity_type', 'node');
+
+  // Store them by group id and as one big array of node ids.
+  $group_nids = array();
+  foreach ($group_nodes->execute() as $record) {
+    $group_nids['all'][] = $record->entity_id;
+    $group_nids[$record->gid][] = $record->entity_id;
+  }
+
+  // If there are no group nodes, there is nothing for us left to do.
+  if (empty($group_nids['all'])) {
+    return;
+  }
+
+  // Get a reference to the existing query conditions.
+  $conditions = &$query->conditions();
+
+  // Check for a node access query and store its condition index.
+  $node_access_index = FALSE;
+  foreach ($conditions as $index => $condition) {
+    if ($index == '#conjunction') {
+      continue;
+    }
+
+    if ($condition['value'] instanceof SelectQuery) {
+      $tables = $condition['value']->getTables();
+
+      if (isset($tables['na']['table']) && $tables['na']['table'] == 'node_access') {
+        $node_access_index = $index;
+        break;
+      }
+    }
+  }
+
+  // If the user can bypass group access, most of this function need not run.
+  if (user_access('bypass group access', $account)) {
+    // If there is no node access query and the user can bypass group access, we
+    // do not need to alter the query. So exit the function early.
+    if ($node_access_index === FALSE) {
+      return;
+    }
+
+    // If there is a node access query, we only run it on non-group nodes,
+    // meaning any group node passes the access checks.
+    $node_access = db_or();
+
+    // Store the original node access condition.
+    $node_access_conditions = &$node_access->conditions();
+    $node_access_conditions[0] = $conditions[$node_access_index];
+
+    // Remove the node access condition from the top level conditions.
+    unset($conditions[$node_access_index]);
+
+    // Add our 'or is a group node' condition to node access checks.
+    $node_access->condition("$alias.nid", $group_nids['all'], 'IN');
+
+    // Finally, add our combined access check to the query.
+    $query->condition($node_access);
+  }
+
+  // If the user can't bypass group access, we'll need to determine which
+  // group nodes he has access to for the requested operation.
+  else {
+    // Read the operation from the query, if provided.
+    if (!$op = $query->getMetaData('op')) {
+      $op = 'view';
+    }
+
+    // Retrieve the group access condition info for this user and operation.
+    $access_info = _gnode_node_access_info($account, $op);
+
+    // This will be used to store conditions for group nodes.
+    $group_access = db_or();
+
+    // Retrieve all node ids of group nodes along with their group id.
+    $group_nodes->addField('ge', 'gid');
+
+    if (!empty($access_info['full access'])) {
+      $query_nids = array();
+      foreach (array_intersect_key($group_nids, $access_info['full access']) as $nids) {
+        $query_nids = array_merge($query_nids, $nids);
+      }
+
+      if ($query_nids) {
+        $group_access->condition("$alias.nid", $query_nids, 'IN');
+      }
+    }
+
+    foreach (node_type_get_types() as $node_type => $type_info) {
+      if (!empty($access_info['type access'][$node_type])) {
+        $query_nids = array();
+        foreach (array_intersect_key($group_nids, $access_info['type access'][$node_type]) as $nids) {
+          $query_nids = array_merge($query_nids, $nids);
+        }
+
+        if ($query_nids) {
+          $group_access->condition(db_and()
+            ->condition("$alias.type", $node_type)
+            ->condition("$alias.nid", $query_nids, 'IN')
+          );
+        }
+      }
+
+      if (!empty($access_info['user access'][$node_type])) {
+        $query_nids = array();
+        foreach (array_intersect_key($group_nids, $access_info['user access'][$node_type]) as $nids) {
+          $query_nids = array_merge($query_nids, $nids);
+        }
+
+        if ($query_nids) {
+          $group_access->condition(db_and()
+            ->condition("$alias.uid", $account->uid)
+            ->condition("$alias.type", $node_type)
+            ->condition("$alias.nid", $query_nids, 'IN')
+          );
+        }
+      }
+    }
+
+    // If there is no node access query and the user cannot bypass group
+    // access, we need to add a condition checking whether the node is a
+    // group node. In case it is, it needs to match group access conditions.
+    if ($node_access_index === FALSE) {
+      $group_access->condition("$alias.nid", $group_nids['all'], 'NOT IN');
+      $query->condition($group_access);
+    }
+
+    // If there is a node access query, we need to add it to non-group nodes
+    // only. Group nodes should still bypass node access and check only for
+    // group access conditions.
+    else {
+      $node_access = db_and();
+
+      // Store the original node access condition.
+      $node_access_conditions = &$node_access->conditions();
+      $node_access_conditions[0] = $conditions[$node_access_index];
+
+      // Remove the node access condition from the top level conditions.
+      unset($conditions[$node_access_index]);
+
+      // Add our 'not a group node' condition to node access checks.
+      $node_access->condition("$alias.nid", $group_nids['all'], 'NOT IN');
+
+      // Finally, add our combined access check to the query.
+      $query->condition(db_or()
+        ->condition($node_access)
+        ->condition($group_access)
+      );
+    }
+  }
+}

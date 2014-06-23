@@ -1,0 +1,61 @@
+<?php 
+/**
+ * @file
+ * This is a process module to add the approval process in the checkout process.
+ * 
+ * @param path
+ *		
+ *@param arg
+ * 		
+ */
+/**
+ * Implements hook_commerce_checkout_page_info().
+ */
+function approve_process_commerce_checkout_page_info() {
+  $checkout_pages = array();
+ 
+  $checkout_pages['approve_process_form_page'] = array(
+    'name' => t('Approve process form'),
+    'title' => t('Get Approval'),
+    'weight' => -10,
+    'status_cart' => FALSE,
+    'buttons' => TRUE,
+  );
+ 
+  return $checkout_pages;
+}
+
+/**
+ * Implements hook_commerce_checkout_page_info().
+ */
+function approve_process_commerce_checkout_pane_info() {
+  $checkout_panes = array();
+ 
+  $checkout_panes['aprrove_process_pane'] = array(
+    'title' => t('nothing'),
+    'file' => 'aprrove_process.checkout_pane.inc',
+    'base' => 'aprrove_process_pane',
+    'page' => 'aprrove_process_form_page',
+    'callbacks' => array(
+      'checkout_form_submit' => 'aprrove_process_pane_checkout_form_submit',
+    ),
+    'fieldset' => FALSE,
+  );
+ 
+  return $checkout_panes;
+}
+
+/**
+ * Implements hook_commerce_checkout_router().
+ *
+ * Create node on complete checkout page.
+ */
+function approce_process_commerce_checkout_router($order, $checkout_page) {
+  if ($checkout_page['page_id'] != 'complete' || !isset($order->data['node'])) {
+    return;
+  }
+ 
+  $node = (object) $order->data['node'];
+  node_save($node);
+  unset($order->data['node']);
+}

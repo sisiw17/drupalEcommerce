@@ -1,0 +1,5 @@
+name = Approve Process
+description = This is the module used for a approve process.
+package = approve_process
+dependencies [] = commerce_checkout
+core = 7.x
